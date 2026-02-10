@@ -28,6 +28,11 @@ git clone https://github.com/CodemasterDevops421/codex-tmux.git
 cd codex-tmux
 ```
 
+### One-command quickstart (recommended)
+```bash
+./scripts/quickstart.sh
+```
+
 ### Install `codexctl`
 ```bash
 mkdir -p ~/bin
