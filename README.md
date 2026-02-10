@@ -82,6 +82,46 @@ Events are appended to:
 
 The backend tails this file, writes to SQLite (`~/.codexdash/codexdash.db`), and streams events to the UI via WebSocket.
 
+### tmux + Codex architecture (in-depth)
+Codex runs inside `tmux` panes created by `codexctl`. CodexDash observes and correlates activity without modifying `tmux`:
+
+**Execution path**
+1. You run: `~/bin/codexdash send ...`
+2. `codexdash` logs a `dispatch` event and shells out to `~/bin/codexctl send ...`
+3. `codexctl` injects the prompt into the target tmux pane(s)
+4. Codex runs in each pane and streams output in-place
+5. CodexDash continuously `capture-pane`’s output and emits `pane_output` events
+6. Backend tails events and updates SQLite + broadcasts to the UI
+
+**Why this works without tmux modifications**
+- We rely on `tmux capture-pane` to read the visible buffer.
+- We dynamically re-resolve panes every poll to avoid stale IDs.
+- We use window names (`fast`, `deep`, `test`, `sec`) or `@codexctl_pane_*` options if present.
+
+**Pane mapping logic**
+- **Windows mode**: each agent is a tmux window named `fast`, `deep`, `test`, `sec`
+- **Pane mode**: use tmux options `@codexctl_pane_fast`, etc., if set
+- **Fallback**: infer from pane title or current command
+
+**Job correlation**
+- `codexdash` emits a `dispatch` event with a generated `job_id`.
+- `codexctl` injects `JOB:...` markers into pane output.
+- The backend extracts `[JOB:...]` from pane output and links those lines to the job.
+- This produces per-job transcripts even when Codex prints interleaved output.
+
+**Sub-agent detection**
+- If Codex spawns internal sub-agents/tools, it often prints markers like `sub-agent:` or `tool:`.
+- CodexDash tags those lines with `sub_agent` for nested thread display.
+
+**Token accounting**
+- Exact tokens are parsed if Codex prints them.
+- Otherwise estimate: `tiktoken` if available, else `ceil(chars/4)`.
+
+**Operational considerations**
+- Large pane buffers can create big `pane_output` events.
+- If you want less history, reduce tmux history limit or lower `capture-pane` lines.
+- UI updates typically appear within ~250ms of new events.
+
 ### tmux discovery
 The backend maps agent names to panes every poll:
 - **windows mode**: windows named `fast`, `deep`, `test`, `sec`
