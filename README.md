@@ -22,10 +22,29 @@ Production-ready, local-only dashboard for monitoring `tmux`/`codexctl` parallel
 - `tmux`
 - Existing `codexctl` setup in `~/bin/codexctl`
 
+## One-time Setup (any Linux)
+```bash
+git clone https://github.com/CodemasterDevops421/codex-tmux.git
+cd codex-tmux
+```
+
+### Install `codexctl`
+```bash
+mkdir -p ~/bin
+cp -a tmux/codexctl/codexctl ~/bin/codexctl
+cp -a tmux/codexctl/install.sh ~/bin/codexctl-install.sh
+chmod +x ~/bin/codexctl ~/bin/codexctl-install.sh
+```
+
+### (Optional) Review tmux notes
+```bash
+cat tmux/work-tmux/tmux-sugent.md
+```
+
 ## Install
 ### Backend
 ```bash
-cd /home/chaithupi5/codexdash/backend
+cd ./backend
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
@@ -33,21 +52,21 @@ pip install -r requirements.txt
 
 ### Frontend
 ```bash
-cd /home/chaithupi5/codexdash/frontend
+cd ./frontend
 npm install
 ```
 
 ## Run (development)
 ### Backend dev
 ```bash
-cd /home/chaithupi5/codexdash/backend
+cd ./backend
 . .venv/bin/activate
 uvicorn app.main:app --host 0.0.0.0 --port 8090
 ```
 
 ### Frontend dev
 ```bash
-cd /home/chaithupi5/codexdash/frontend
+cd ./frontend
 npm run dev
 ```
 
@@ -56,14 +75,14 @@ Open:
 
 ## Production build + serve
 ```bash
-cd /home/chaithupi5/codexdash/frontend
+cd ./frontend
 npm run build
 npm run preview
 ```
 
 ### Optional systemd backend service
 ```bash
-sudo cp /home/chaithupi5/codexdash/systemd/codexdash-backend.service /etc/systemd/system/
+sudo cp ./systemd/codexdash-backend.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now codexdash-backend
 ```
