@@ -85,6 +85,18 @@ npm run build
 npm run preview
 ```
 
+## Docker (easy mode)
+This runs backend + frontend in containers and is ideal for quick setup.
+
+```bash
+docker compose up --build -d
+```
+
+Open:
+- `http://<host-ip>:5173`
+
+**tmux note**: Docker containers cannot see host `tmux` by default. The dashboard will still work with events logged by `codexdash`, but pane capture requires access to the host tmux socket. If you want tmux probing from Docker, run on Linux with `network_mode: host` and bind-mount the tmux socket (see `docker-compose.yml`).
+
 ### Optional systemd backend service
 ```bash
 sudo cp ./systemd/codexdash-backend.service /etc/systemd/system/

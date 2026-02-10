@@ -5,9 +5,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      "/api": "http://localhost:8090",
+      "/api": process.env.VITE_PROXY_TARGET || "http://localhost:8090",
       "/ws": {
-        target: "ws://localhost:8090",
+        target: (process.env.VITE_PROXY_TARGET || "http://localhost:8090").replace("http", "ws"),
         ws: true
       }
     }

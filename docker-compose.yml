@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      - CODEXDASH_DIR=/data
+      - CODEXDASH_EVENTS=/data/events.ndjson
+      - CODEXDASH_DB=/data/codexdash.db
+      - CODEX_TMUX_SESSION=codexctl
+    volumes:
+      - codexdash_data:/data
+      # Optional: enable tmux probing from container (host-only)
+      # - /tmp/tmux-1000:/tmp/tmux-1000
+    network_mode: host
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    environment:
+      - VITE_PROXY_TARGET=http://localhost:8090
+    network_mode: host
+    restart: unless-stopped
+
+volumes:
+  codexdash_data:
