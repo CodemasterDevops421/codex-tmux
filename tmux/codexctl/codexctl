@@ -1,0 +1,648 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION="${CODEXCTL_SESSION:-codexctl}"
+WINDOW="${CODEXCTL_WINDOW:-agents}"
+
+DEFAULT_DIR="${CODEXCTL_DIR:-$PWD}"
+DEFAULT_AGENTS="${CODEXCTL_AGENTS:-fast,deep,test,sec}"
+DEFAULT_PROFILES="${CODEXCTL_PROFILES:-,,,}"
+DEFAULT_MODELS="${CODEXCTL_MODELS:-,,,}"
+DEFAULT_WAIT="${CODEXCTL_WAIT:-90}"
+DEFAULT_TAIL="${CODEXCTL_TAIL:-260}"
+DEFAULT_SCROLL="${CODEXCTL_SCROLL:-5000}"
+DEFAULT_LAYOUT="${CODEXCTL_LAYOUT:-tiled}"
+CODEX_BIN="${CODEXCTL_CODEX_BIN:-codex}"
+# Prefer CODEXCTL_CODEX_ARGS, but allow CODEX_ARGS for backward compatibility.
+CODEXCTL_CODEX_ARGS="${CODEXCTL_CODEX_ARGS:-${CODEX_ARGS:-}}"
+
+# --- util ---
+die(){ echo "ERROR: $*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+now_ts(){ date +%Y%m%d_%H%M%S; }
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+ensure_tmp() {
+  local uid; uid="$(id -u)"
+  mkdir -p "/tmp/tmux-$uid" >/dev/null 2>&1 || true
+  chmod 700 "/tmp/tmux-$uid" >/dev/null 2>&1 || true
+}
+
+has_session(){ tmux has-session -t "$SESSION" 2>/dev/null; }
+
+# Store agent->pane mapping in tmux user options:
+#   @codexctl_agents="fast,deep,test,sec"
+#   @codexctl_pane_fast="%2" etc.
+set_agents_meta() {
+  local agents_csv="$1" profiles_csv="$2" models_csv="$3" base_dir="$4"
+  tmux set-option -t "$SESSION" -gq "@codexctl_agents" "$agents_csv"
+  tmux set-option -t "$SESSION" -gq "@codexctl_profiles" "$profiles_csv"
+  tmux set-option -t "$SESSION" -gq "@codexctl_models" "$models_csv"
+  tmux set-option -t "$SESSION" -gq "@codexctl_dir" "$base_dir"
+}
+
+get_opt(){ tmux show-option -t "$SESSION" -gvq "$1" 2>/dev/null || true; }
+set_opt(){ tmux set-option -t "$SESSION" -gq "$1" "$2"; }
+
+agents_list(){
+  local a; a="$(get_opt "@codexctl_agents")"
+  [[ -n "$a" ]] || a="$DEFAULT_AGENTS"
+  printf '%s\n' "$a"
+}
+
+agent_names_array(){
+  local a; a="$(agents_list)"
+  local -a arr=()
+  IFS=',' read -r -a arr <<< "$a"
+  for x in "${arr[@]}"; do
+    x="$(trim "$x")"
+    [[ -n "$x" ]] && printf '%s\n' "$x"
+  done
+}
+
+pane_for_agent(){
+  local name="$1"
+  get_opt "@codexctl_pane_${name}"
+}
+
+profile_for_agent(){
+  local agents_csv profiles_csv
+  agents_csv="$(agents_list)"
+  profiles_csv="$(get_opt "@codexctl_profiles")"
+  [[ -n "$profiles_csv" ]] || profiles_csv="$DEFAULT_PROFILES"
+
+  local -a A=() P=()
+  IFS=',' read -r -a A <<< "$agents_csv"
+  IFS=',' read -r -a P <<< "$profiles_csv"
+  local i
+  for i in "${!A[@]}"; do
+    local an; an="$(trim "${A[$i]}")"
+    if [[ "$an" == "$1" ]]; then
+      local pv="${P[$i]:-}"
+      pv="$(trim "$pv")"
+      printf '%s' "$pv"
+      return 0
+    fi
+  done
+  printf ''
+}
+
+model_for_agent(){
+  local agents_csv models_csv
+  agents_csv="$(agents_list)"
+  models_csv="$(get_opt "@codexctl_models")"
+  [[ -n "$models_csv" ]] || models_csv="$DEFAULT_MODELS"
+
+  local -a A=() M=()
+  IFS=',' read -r -a A <<< "$agents_csv"
+  IFS=',' read -r -a M <<< "$models_csv"
+  local i
+  for i in "${!A[@]}"; do
+    local an; an="$(trim "${A[$i]}")"
+    if [[ "$an" == "$1" ]]; then
+      local mv="${M[$i]:-}"
+      mv="$(trim "$mv")"
+      printf '%s' "$mv"
+      return 0
+    fi
+  done
+  printf ''
+}
+
+agent_by_index(){
+  local idx="$1"
+  [[ "$idx" =~ ^[0-9]+$ ]] || die "index must be a number: $idx"
+  local i=0
+  while IFS= read -r name; do
+    i=$((i+1))
+    if [[ "$i" -eq "$idx" ]]; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+  done < <(agent_names_array)
+  die "no agent @$idx"
+}
+
+resolve_target_to_panes(){
+  local t="$1"
+  local -a out=()
+
+  if [[ "$t" == "all" ]]; then
+    while IFS= read -r name; do
+      local p; p="$(pane_for_agent "$name")"
+      [[ -n "$p" ]] && out+=("$p")
+    done < <(agent_names_array)
+    printf '%s\n' "${out[@]}"
+    return 0
+  fi
+
+  if [[ "$t" =~ ^@([0-9]+)$ ]]; then
+    local name; name="$(agent_by_index "${BASH_REMATCH[1]}")"
+    local p; p="$(pane_for_agent "$name")"
+    [[ -n "$p" ]] || die "agent pane missing for @$name"
+    printf '%s\n' "$p"
+    return 0
+  fi
+
+  if [[ "$t" =~ ^@([a-zA-Z0-9_-]+)$ ]]; then
+    local name="${BASH_REMATCH[1]}"
+    local p; p="$(pane_for_agent "$name")"
+    [[ -n "$p" ]] || die "no agent named @$name"
+    printf '%s\n' "$p"
+    return 0
+  fi
+
+  if [[ "$t" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    local p; p="$(pane_for_agent "$t")"
+    if [[ -n "$p" ]]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  fi
+
+  tmux display-message -p -t "$t" '#{pane_id}' >/dev/null 2>&1 || die "unknown target: $t"
+  printf '%s\n' "$t"
+}
+
+mk_job(){
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    date +%s%N
+  fi
+}
+
+# RFC-safe send:
+# - clear prefill: Home + C-k
+# - literal prompt: -l
+# - submit: separate Enter
+send_prompt(){
+  local pane="$1"
+  local prompt="$2"
+
+  tmux send-keys -t "$pane" Home C-k
+
+  mapfile -t LINES < <(printf '%s' "$prompt")
+  for i in "${!LINES[@]}"; do
+    tmux send-keys -t "$pane" -l "${LINES[$i]}"
+    if [[ $i -lt $((${#LINES[@]} - 1)) ]]; then
+      tmux send-keys -t "$pane" C-j
+    fi
+  done
+
+  sleep 0.12
+  tmux send-keys -t "$pane" Enter
+}
+
+capture_scroll(){
+  local pane="$1" scroll="$2"
+  tmux capture-pane -p -t "$pane" -S "-$scroll" 2>/dev/null || true
+}
+
+capture_tail(){
+  local pane="$1" tail="$2"
+  tmux capture-pane -p -t "$pane" -S "-$tail" 2>/dev/null || true
+}
+
+wait_for_job(){
+  local pane="$1" job="$2" timeout="$3" scroll="$4"
+  local deadline=$((SECONDS + timeout))
+
+  while (( SECONDS < deadline )); do
+    local cap nlcap job_line worked_line
+    cap="$(capture_scroll "$pane" "$scroll")"
+    nlcap="$(printf '%s\n' "$cap" | nl -ba -w1 -s $'\t')"
+
+    job_line="$(printf '%s\n' "$nlcap" | awk -v j="[JOB:$job]" '$0 ~ j {n=$1} END{print n+0}')"
+    if [[ "${job_line:-0}" -gt 0 ]]; then
+      worked_line="$(printf '%s\n' "$nlcap" \
+        | awk -v jl="$job_line" '
+            ($0 ~ /Worked for/ || $0 ~ /─ Worked for/) && $1 > jl { print $1; exit }
+          ' | tr -d '\r')"
+      if [[ -n "${worked_line:-}" ]]; then
+        return 0
+      fi
+    fi
+
+    sleep 0.25
+  done
+
+  return 1
+}
+
+# --- tmux cosmetics (per-session, no global config changes) ---
+apply_cool_ui(){
+  tmux set-option -t "$SESSION" -gq status on
+  tmux set-option -t "$SESSION" -gq status-interval 2
+  tmux set-option -t "$SESSION" -gq status-left " codexctl "
+  tmux set-option -t "$SESSION" -gq status-right " #S:#I.#P  %Y-%m-%d %H:%M "
+  tmux set-option -t "$SESSION" -gq pane-border-status top
+  tmux set-option -t "$SESSION" -gq pane-border-format " #{pane_title} "
+  tmux set-option -t "$SESSION" -gq message-style "bg=black,fg=white"
+  tmux set-option -t "$SESSION" -gq display-time 1500
+}
+
+apply_layout(){
+  local layout="$1"
+  case "$layout" in
+    tiled|even-horizontal|even-vertical)
+      tmux select-layout -t "$SESSION:$WINDOW" "$layout" >/dev/null 2>&1 || true
+      ;;
+    *)
+      tmux select-layout -t "$SESSION:$WINDOW" tiled >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+# --- commands ---
+cmd_up(){
+  ensure_tmp
+  have tmux || die "tmux not installed"
+  have "$CODEX_BIN" || die "'$CODEX_BIN' not found in PATH"
+
+  local dir="$DEFAULT_DIR"
+  local agents_csv="$DEFAULT_AGENTS"
+  local profiles_csv="$DEFAULT_PROFILES"
+  local models_csv="$DEFAULT_MODELS"
+  local extra_args="$CODEXCTL_CODEX_ARGS"
+  local layout="$DEFAULT_LAYOUT"
+  local windows=0
+  local attach=1
+  local noattach=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir) dir="${2:-$dir}"; shift 2;;
+      --agents) agents_csv="${2:-$agents_csv}"; shift 2;;
+      --profiles) profiles_csv="${2:-$profiles_csv}"; shift 2;;
+      --models) models_csv="${2:-$models_csv}"; shift 2;;
+      --layout) layout="${2:-$layout}"; shift 2;;
+      --windows) windows=1; shift;;
+      --args) extra_args="${2:-$extra_args}"; shift 2;;
+      --unsafe) extra_args="${extra_args} --dangerously-bypass-approvals-and-sandbox"; shift;;
+      --noattach) noattach=1; attach=0; shift;;
+      --attach) attach=1; noattach=0; shift;;
+      *) break;;
+    esac
+  done
+
+  mkdir -p "$dir" >/dev/null 2>&1 || true
+
+  if has_session; then
+    if [[ "$attach" -eq 1 ]]; then tmux attach -t "$SESSION"; fi
+    echo "Session '$SESSION' already running."
+    return 0
+  fi
+
+  tmux new-session -d -s "$SESSION" -n "$WINDOW" -c "$dir"
+  set_agents_meta "$agents_csv" "$profiles_csv" "$models_csv" "$dir"
+  apply_cool_ui
+
+  tmux select-pane -t "$SESSION:$WINDOW.0" -T "CTRL  (codexctl)"
+
+  local -a A=() P=() M=()
+  IFS=',' read -r -a A <<< "$agents_csv"
+  IFS=',' read -r -a P <<< "$profiles_csv"
+  IFS=',' read -r -a M <<< "$models_csv"
+
+  local i
+  for i in "${!A[@]}"; do
+    local name; name="$(trim "${A[$i]}")"
+    [[ -n "$name" ]] || continue
+
+    local prof; prof="$(trim "${P[$i]:-}")"
+    local model; model="$(trim "${M[$i]:-}")"
+
+    local cmd="$CODEX_BIN"
+    if [[ -n "$prof" ]]; then cmd="$cmd --profile $prof"; fi
+    if [[ -n "$model" ]]; then cmd="$cmd -m $model"; fi
+    if [[ -n "$extra_args" ]]; then cmd="$cmd $extra_args"; fi
+
+    if [[ "$windows" -eq 1 ]]; then
+      tmux new-window -t "$SESSION" -n "$name" -c "$dir" "$cmd"
+      local pane_id
+      pane_id="$(tmux display-message -p -t "$SESSION:$name" '#{pane_id}')"
+      set_opt "@codexctl_pane_${name}" "$pane_id"
+      set_opt "@codexctl_profile_${name}" "$prof"
+      set_opt "@codexctl_model_${name}" "$model"
+      tmux select-pane -t "$pane_id" -T "AGENT:@${name}  ${prof:+p:$prof }${model:+m:$model}"
+    else
+      if ! tmux split-window -t "$SESSION:$WINDOW" -c "$dir" "$cmd"; then
+        windows=1
+        tmux new-window -t "$SESSION" -n "$name" -c "$dir" "$cmd"
+        local pane_id
+        pane_id="$(tmux display-message -p -t "$SESSION:$name" '#{pane_id}')"
+        set_opt "@codexctl_pane_${name}" "$pane_id"
+        set_opt "@codexctl_profile_${name}" "$prof"
+        set_opt "@codexctl_model_${name}" "$model"
+        tmux select-pane -t "$pane_id" -T "AGENT:@${name}  ${prof:+p:$prof }${model:+m:$model}"
+      else
+        local pane_id
+        pane_id="$(tmux display-message -p -t "$SESSION:$WINDOW" '#{pane_id}')"
+        set_opt "@codexctl_pane_${name}" "$pane_id"
+        set_opt "@codexctl_profile_${name}" "$prof"
+        set_opt "@codexctl_model_${name}" "$model"
+        tmux select-pane -t "$pane_id" -T "AGENT:@${name}  ${prof:+p:$prof }${model:+m:$model}"
+      fi
+    fi
+  done
+
+  if [[ "$windows" -eq 0 ]]; then
+    apply_layout "$layout"
+  fi
+  tmux select-pane -t "$SESSION:$WINDOW.0"
+
+  echo "Started session '$SESSION' with agents: $agents_csv"
+  if [[ "$attach" -eq 1 ]]; then tmux attach -t "$SESSION"; fi
+}
+
+cmd_attach(){
+  has_session || die "session not running: $SESSION"
+  tmux attach -t "$SESSION"
+}
+
+cmd_down(){
+  has_session || exit 0
+  tmux kill-session -t "$SESSION"
+  echo "Killed session '$SESSION'"
+}
+
+cmd_ids(){
+  has_session || die "session not running: $SESSION"
+  local agents_csv; agents_csv="$(agents_list)"
+  echo "SESSION=$SESSION  WINDOW=$WINDOW"
+  echo "AGENTS=$agents_csv"
+  echo
+  tmux list-panes -t "$SESSION:$WINDOW" -F '#{pane_index} #{pane_id} #{pane_title} #{pane_current_command} #{pane_current_path}'
+  echo
+  local n=0
+  while IFS= read -r name; do
+    n=$((n+1))
+    local p prof model
+    p="$(pane_for_agent "$name")"
+    prof="$(get_opt "@codexctl_profile_${name}")"
+    model="$(get_opt "@codexctl_model_${name}")"
+    printf '@%d  %-10s  pane=%-5s  %s%s\n' "$n" "$name" "$p" \
+      "${prof:+profile=$prof }" "${model:+model=$model}"
+  done < <(agent_names_array)
+}
+
+cmd_send(){
+  has_session || die "session not running: $SESSION"
+
+  local target="${1:-}"; shift || true
+  [[ -n "$target" ]] || die "missing target (e.g., @1, @fast, all)"
+
+  local wait_s="$DEFAULT_WAIT"
+  local tail_n="$DEFAULT_TAIL"
+  local scroll_n="$DEFAULT_SCROLL"
+  local out_dir=""
+  local parallel=0
+  local nojob=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --wait) wait_s="${2:-$wait_s}"; shift 2;;
+      --tail) tail_n="${2:-$tail_n}"; shift 2;;
+      --scroll) scroll_n="${2:-$scroll_n}"; shift 2;;
+      --outdir) out_dir="${2:-}"; shift 2;;
+      --parallel) parallel=1; shift;;
+      --nojob) nojob=1; shift;;
+      --) shift; break;;
+      *) break;;
+    esac
+  done
+
+  local prompt=""
+  if [[ $# -gt 0 ]]; then
+    if [[ "$1" == "-" ]]; then prompt="$(cat)"; else prompt="$1"; fi
+  else
+    prompt="$(cat)"
+  fi
+  [[ -n "$prompt" ]] || die "empty prompt"
+
+  if [[ -n "$out_dir" ]]; then mkdir -p "$out_dir"; fi
+
+  mapfile -t panes < <(resolve_target_to_panes "$target")
+  [[ "${#panes[@]}" -gt 0 ]] || die "no panes resolved for target: $target"
+
+  run_one(){
+    local pane="$1"
+    local job; job="$(mk_job)"
+    local final="$prompt"
+    if [[ "$nojob" -eq 0 ]]; then final="[JOB:$job] $prompt"; fi
+
+    send_prompt "$pane" "$final"
+
+    if [[ "$wait_s" -gt 0 && "$nojob" -eq 0 ]]; then
+      wait_for_job "$pane" "$job" "$wait_s" "$scroll_n" || true
+    fi
+
+    local out; out="$(capture_tail "$pane" "$tail_n")"
+    if [[ -n "$out_dir" ]]; then
+      printf '%s\n' "$out" > "${out_dir%/}/pane_${pane#%}_${job}.txt"
+      printf '%s %s %s\n' "$pane" "$job" "${out_dir%/}/pane_${pane#%}_${job}.txt"
+    else
+      printf '=== %s JOB:%s ===\n' "$pane" "$job"
+      printf '%s\n' "$out"
+    fi
+  }
+
+  if [[ "$parallel" -eq 1 && "${#panes[@]}" -gt 1 ]]; then
+    for p in "${panes[@]}"; do ( run_one "$p" ) & done
+    wait
+  else
+    for p in "${panes[@]}"; do run_one "$p"; done
+  fi
+}
+
+route_pick_agent(){
+  local prompt="$1"
+
+  has_name(){ [[ -n "$(pane_for_agent "$1")" ]]; }
+
+  shopt -s nocasematch
+  if has_name "test" && [[ "$prompt" =~ (pytest|jest|unit\ test|integration\ test|coverage|mock|fixture|assert) ]]; then
+    echo "test"; return
+  fi
+  if has_name "sec" && [[ "$prompt" =~ (security|secret|vuln|injection|auth|oauth|csrf|xss|sql) ]]; then
+    echo "sec"; return
+  fi
+  if has_name "deep" && { [[ ${#prompt} -gt 400 ]] || [[ "$prompt" =~ (design|architecture|refactor|migration|performance|scalability|rewrite) ]]; }; then
+    echo "deep"; return
+  fi
+  if has_name "fast"; then echo "fast"; return; fi
+
+  agent_by_index 1
+}
+
+cmd_route(){
+  has_session || die "session not running: $SESSION"
+  local wait_s="$DEFAULT_WAIT"
+  local tail_n="$DEFAULT_TAIL"
+  local scroll_n="$DEFAULT_SCROLL"
+  local out_dir=""
+  local parallel=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --wait) wait_s="${2:-$wait_s}"; shift 2;;
+      --tail) tail_n="${2:-$tail_n}"; shift 2;;
+      --scroll) scroll_n="${2:-$scroll_n}"; shift 2;;
+      --outdir) out_dir="${2:-}"; shift 2;;
+      --parallel) parallel=1; shift;;
+      --) shift; break;;
+      *) break;;
+    esac
+  done
+
+  local prompt
+  if [[ "${1:-}" == "-" ]]; then shift; prompt="$(cat)"; else prompt="${1:-}"; fi
+  [[ -n "$prompt" ]] || die "empty prompt"
+
+  local agent; agent="$(route_pick_agent "$prompt")"
+  local pane; pane="$(pane_for_agent "$agent")"
+  [[ -n "$pane" ]] || die "routing picked agent '$agent' but pane missing"
+
+  cmd_send "@$agent" --wait "$wait_s" --tail "$tail_n" --scroll "$scroll_n" ${out_dir:+--outdir "$out_dir"} ${parallel:+--parallel} -- "$prompt"
+}
+
+cmd_ship(){
+  has_session || die "session not running: $SESSION"
+
+  local feature="${1:-}"
+  [[ -n "$feature" ]] || die "usage: codexctl ship \"feature description\""
+
+  local out_root="${2:-/tmp/codex_ship_$(now_ts)}"
+  mkdir -p "$out_root"
+
+  local plan_agent="deep"
+  local impl_agent="fast"
+  local test_agent="test"
+  local sec_agent="sec"
+
+  [[ -n "$(pane_for_agent "$plan_agent")" ]] || plan_agent="$(agent_by_index 1)"
+  [[ -n "$(pane_for_agent "$impl_agent")" ]] || impl_agent="$(agent_by_index 1)"
+  [[ -n "$(pane_for_agent "$test_agent")" ]] || test_agent="$plan_agent"
+  [[ -n "$(pane_for_agent "$sec_agent")" ]] || sec_agent="$plan_agent"
+
+  local PLAN_PROMPT
+  PLAN_PROMPT=$(cat <<EOF
+You are the PLANNER agent. READ-ONLY (do not edit files).
+Goal: ship this feature safely: ${feature}
+Deliver:
+1) Implementation plan (steps, files likely touched)
+2) Edge cases + failure modes
+3) Rollback plan
+4) Minimal acceptance tests checklist
+Keep it concise but actionable.
+EOF
+  )
+
+  local TEST_PROMPT
+  TEST_PROMPT=$(cat <<EOF
+You are the TEST agent. READ-ONLY unless writing new tests only (no production edits).
+Goal: ship this feature: ${feature}
+Deliver:
+1) Test plan (unit/integration/e2e as applicable)
+2) Exact commands to run tests on Debian
+3) Common pitfalls + flakiness risks
+EOF
+  )
+
+  local SEC_PROMPT
+  SEC_PROMPT=$(cat <<EOF
+You are the SECURITY/PERF reviewer. READ-ONLY (no edits).
+Goal: ship this feature: ${feature}
+Deliver:
+1) Security review checklist items relevant here (secrets, injection, auth, file ops)
+2) Performance risks
+3) Observability/alerts suggestions
+EOF
+  )
+
+  local IMPL_PROMPT
+  IMPL_PROMPT=$(cat <<EOF
+You are the IMPLEMENTER agent (you can edit code).
+Goal: implement this feature end-to-end: ${feature}
+Rules:
+- Keep changes minimal + production-safe.
+- Run tests/linters if available; include exact commands you ran.
+- Summarize files changed + how to verify manually.
+EOF
+  )
+
+  cmd_send "@$plan_agent" --parallel --wait 180 --outdir "$out_root" -- "$PLAN_PROMPT" &
+  cmd_send "@$test_agent" --parallel --wait 180 --outdir "$out_root" -- "$TEST_PROMPT" &
+  cmd_send "@$sec_agent"  --parallel --wait 180 --outdir "$out_root" -- "$SEC_PROMPT" &
+  cmd_send "@$impl_agent" --parallel --wait 600 --outdir "$out_root" -- "$IMPL_PROMPT" &
+  wait
+
+  echo "Ship run outputs saved in: $out_root"
+  ls -ltr "$out_root" | tail -n 20 || true
+}
+
+usage(){
+  cat <<'USAGE'
+codexctl up [--dir DIR] [--agents "fast,deep,test,sec"] [--profiles ",,," ] [--models ",,," ] [--layout tiled|even-horizontal|even-vertical] [--windows] [--noattach]
+codexctl attach
+codexctl down
+codexctl ids
+
+codexctl send <target> [opts] -- <prompt>
+  targets:
+    @1         (agent index)
+    @fast      (agent name)
+    fast       (agent name)
+    all        (all agents)
+    %2         (tmux pane id)
+
+  opts:
+    --wait <sec>     (default 90) 0 = don't wait
+    --tail <lines>   (default 260)
+    --scroll <lines> (default 5000)
+    --outdir <dir>   write outputs to files
+    --parallel       send to multiple panes concurrently (use with target=all)
+    --nojob          do not prefix [JOB:...] marker
+
+codexctl route [opts] -- <prompt>
+  (auto-picks agent by keywords/length; prefers test/sec/deep/fast if present)
+
+codexctl ship "feature description" [outdir]
+  (parallel plan/test/sec + implement)
+
+Examples:
+  codexctl up --dir ~/work/tmux --agents "fast,deep,test,sec" --noattach
+  codexctl up --dir ~/work/tmux --agents "fast,deep,test,sec" --windows
+  codexctl up --dir ~/work/tmux --agents "fast,deep,test,sec" --layout even-vertical
+  codexctl attach
+  codexctl ids
+  codexctl send all --parallel --outdir /tmp/codex_out -- "Say hello and summarize current folder."
+  codexctl send @test --wait 120 --outdir /tmp/codex_out -- "Write a test plan for module X."
+  codexctl route --outdir /tmp/codex_out -- "Refactor the pipeline; improve reliability and performance."
+  codexctl ship "Add feature flag for autopost scheduling and rollback."
+USAGE
+}
+
+main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    up) cmd_up "$@";;
+    attach) cmd_attach;;
+    down) cmd_down;;
+    ids) cmd_ids;;
+    send) cmd_send "$@";;
+    route) cmd_route "$@";;
+    ship) cmd_ship "$@";;
+    ""|-h|--help|help) usage;;
+    *) usage; exit 2;;
+  esac
+}
+
+main "$@"
