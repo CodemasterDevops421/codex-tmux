@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+HOME = Path(os.path.expanduser("~"))
+CODEXDASH_DIR = Path(os.path.expanduser(os.environ.get("CODEXDASH_DIR", str(HOME / ".codexdash"))))
+EVENTS_PATH = Path(os.path.expanduser(os.environ.get("CODEXDASH_EVENTS", str(CODEXDASH_DIR / "events.ndjson"))))
+CODEXCTL = HOME / "bin" / "codexctl"
+
+
+def now_ms() -> int:
+  return int(time.time() * 1000)
+
+
+def hash_text(text: str) -> str:
+  return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def write_event(event: dict) -> None:
+  EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+  with EVENTS_PATH.open("a", encoding="utf-8") as f:
+    f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def parse_prompt(args: list[str]) -> str:
+  # Best-effort: --prompt/-p, --prompt-file, or last positional
+  if "--prompt" in args:
+    i = args.index("--prompt")
+    if i + 1 < len(args):
+      return args[i + 1]
+  if "-p" in args:
+    i = args.index("-p")
+    if i + 1 < len(args):
+      return args[i + 1]
+  if "--prompt-file" in args:
+    i = args.index("--prompt-file")
+    if i + 1 < len(args):
+      try:
+        return Path(args[i + 1]).read_text(encoding="utf-8")
+      except Exception:
+        return ""
+  # if stdin is piped
+  if not sys.stdin.isatty():
+    data = sys.stdin.read()
+    if data.strip():
+      return data
+  # last arg if not a flag
+  for arg in reversed(args):
+    if not arg.startswith("-"):
+      return arg
+  return ""
+
+
+def parse_targets(args: list[str]) -> list[str]:
+  targets = []
+  for arg in args:
+    if arg.startswith("@"):
+      targets.append(arg.lstrip("@"))
+  return targets
+
+
+def parse_outdir(args: list[str]) -> str | None:
+  if "--outdir" in args:
+    i = args.index("--outdir")
+    if i + 1 < len(args):
+      return args[i + 1]
+  return None
+
+
+def run_codexctl(argv: list[str]) -> int:
+  if not CODEXCTL.exists():
+    print(f"codexctl not found at {CODEXCTL}", file=sys.stderr)
+    return 127
+
+  job_id = os.environ.get("CODEXDASH_JOB_ID") or str(uuid.uuid4())
+  prompt = parse_prompt(argv)
+  prompt_bytes = len(prompt.encode("utf-8")) if prompt else 0
+  prompt_hash = hash_text(prompt) if prompt else None
+  targets = parse_targets(argv)
+  outdir = parse_outdir(argv)
+
+  dispatch_event = {
+    "ts": now_ms(),
+    "type": "dispatch",
+    "session": None,
+    "agent": targets[0] if len(targets) == 1 else None,
+    "pane_id": None,
+    "window_name": None,
+    "job_id": job_id,
+    "prompt_text": prompt if prompt and len(prompt) <= 10000 else None,
+    "prompt_hash": prompt_hash,
+    "prompt_bytes": prompt_bytes,
+    "output_path": outdir,
+    "output_bytes": None,
+    "model": None,
+    "args": argv,
+  }
+  write_event(dispatch_event)
+
+  cmd = [str(CODEXCTL), *argv]
+  proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+  def stream(pipe, stream_name: str) -> None:
+    if pipe is None:
+      return
+    for line in pipe:
+      ev = {
+        "ts": now_ms(),
+        "type": "controller_output",
+        "session": None,
+        "agent": None,
+        "pane_id": None,
+        "window_name": None,
+        "job_id": job_id,
+        "text": line.rstrip("\n"),
+        "stream": stream_name,
+      }
+      write_event(ev)
+
+  import threading
+
+  t1 = threading.Thread(target=stream, args=(proc.stdout, "stdout"), daemon=True)
+  t2 = threading.Thread(target=stream, args=(proc.stderr, "stderr"), daemon=True)
+  t1.start()
+  t2.start()
+  proc.wait()
+  t1.join(timeout=1)
+  t2.join(timeout=1)
+
+  done_event = {
+    "ts": now_ms(),
+    "type": "dispatch_done",
+    "session": None,
+    "agent": targets[0] if len(targets) == 1 else None,
+    "pane_id": None,
+    "window_name": None,
+    "job_id": job_id,
+    "exit_code": proc.returncode,
+  }
+  write_event(done_event)
+  return proc.returncode
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(prog="codexdash")
+  parser.add_argument("command", help="codexctl subcommand")
+  parser.add_argument("args", nargs=argparse.REMAINDER)
+  ns = parser.parse_args()
+
+  argv = [ns.command, *ns.args]
+  if ns.command == "send":
+    return run_codexctl(argv)
+
+  # passthrough
+  cmd = [str(CODEXCTL), *argv]
+  return subprocess.call(cmd)
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
